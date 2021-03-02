@@ -1,8 +1,13 @@
 using StatsBase
+using Flux
+using Zygote
+using ReinforcementLearning
 
 export Field, empty, cross, naught, TTTEnv, reset!, state, is_win, is_draw,
     is_done, TTTLearner, find_boards, train!, play_game, pp, eval_learner,
-    play_against, play_and_learn
+    play_against, play_and_learn, NNTTTLearner
+
+abstract type AbstractTTTLearner <: AbstractLearner end
 
 # First, let's get some data structures set up. A board is a $3 \times 3$ matrix with each field being either empty, or occupied by a cross or a naught. Let's define a Field as being either empty, having a cross or having a naught.
 @enum Field empty cross naught
@@ -48,6 +53,8 @@ mutable struct TTTEnv
     reward::Float64
     done::Bool
 end
+
+TTTEnv() = TTTEnv(fill(empty, (3, 3)), 0.0, false)
 
 # Now, let's define our functions. Notice that our functions now take an environment as first argument instead of a state. This has no significant consequences, it just makes for better organized code.
 state(env::TTTEnv) = env.state
@@ -139,7 +146,7 @@ end
 # This picture would tell us that bottom left corner is probably the best choice, but bottom right is probably also good.
 #
 # The idea is to try some games, figure out what works and what doesn't and then update the probabilities somehow. With that in mind, let's define an agent to simply be such a map from states to probabilities:
-mutable struct TTTLearner
+mutable struct TTTLearner <: AbstractTTTLearner
     model::Dict{Board, Array{Float64, 2}}
 end
 
@@ -194,7 +201,7 @@ end
 # Let's talk a bit about the choice of rewards. As you can see, any reward grater than 1 will encourage the behaviour that lead to that reward and a reward less than 1 will discourage it. 
 
 # That's the setup. All there's left to do is to play some games:
-function play_game(env::TTTEnv, learner::TTTLearner)
+function play_game(env::TTTEnv, learner::AbstractTTTLearner)
     trajectory = Vector{Board}()
     actions = Vector{Action}()
     reset!(env)
@@ -209,7 +216,7 @@ end
 # Most of this function is book-keeping to build the trajectory. Actually, a single round of a game can be expressed as simply `env(learner(env))`.
 
 # To make things easier for ourselves, we'll create a function to play lots of games in a row and learn from them. By default, we play 1 000 000 games at a time.
-function train!(learner::TTTLearner, env::TTTEnv ; n=1_000_000)
+function train!(learner::AbstractTTTLearner, env::TTTEnv ; n=1_000_000)
     for _ in 1:n
         trajectory, actions = play_game(env, learner)
         update!(learner, trajectory, actions, reward(env))
@@ -217,7 +224,7 @@ function train!(learner::TTTLearner, env::TTTEnv ; n=1_000_000)
 end
 
 # We want to see if our model has learned something. This function plays 1000 games and records the number of losses, draw and wins.
-function eval_learner(learner::TTTLearner, env::TTTEnv ; n=1000)
+function eval_learner(learner::AbstractTTTLearner, env::TTTEnv ; n=1000)
     rewards = Vector{Float64}()
     for _ in 1:n
         play_game(env, learner)
@@ -231,7 +238,7 @@ end
 
 # That's it, that's all it takes to teach a computer how to play tic tac toe. Just for fun, let's write a function to play againt it:
 
-function play_against(learner::TTTLearner)
+function play_against(learner::AbstractTTTLearner)
     board = fill(empty, (3, 3))
     trajectory = Vector{Board}()
     while ! is_done(board)
@@ -281,10 +288,79 @@ function play_and_learn(learner::TTTLearner)
     update!(learner, trajectory, actions, reward)
 end
 
-# Aaand that's it. After just 1000 games our agent have learned to never lose. If you try to play against it you will notice some curious behaviour from the agent. Try letting it have some wins. Notice, that it often won't go directly for the win and instead secure more ways to win. This is not a problem, since it's going to win either way, and we never told it to win quickly. This teaches us a valuable lesson: we often don't know what behaviour we're encuraging until we see the result of the learning.
+# Aaand that's it. After just 1 000 000 games our agent have learned to never lose. If you try to play against it you will notice some curious behaviour from the agent. Try letting it have some wins. Notice, that it often won't go directly for the win and instead secure more ways to win. This is not a problem, since it's going to win either way, and we never told it to win quickly. This teaches us a valuable lesson: we often don't know what behaviour we're encuraging until we see the result of the learning.
 
 
-# That was fun. But a little unsatisfactory. This solution doesn't scale very well to larger problems.
+# That was fun. But a little unsatisfactory. This solution doesn't scale very well to larger problems or even unbounded problems. The bottleneck is our model. Keeping a complete mapping between states and actions just isn't very practical when the statespace grows. To handle more complex situations, we need something else. It's time to introduce deep neural networks. *fanfare*.
+#
+# Hopefully you know what neural networks are and have at least a basic understanding of how they operate. The neat thing is, that we can reuse most of our machinery from before, we just have to create a new kind of agent. So let's do that:
+
+mutable struct NNTTTLearner{Q} <: AbstractTTTLearner
+    model :: Q
+end
+
+function NNTTTLearner()
+    NNTTTLearner(NeuralNetworkApproximator(Chain(Dense(9, 128, relu), Dense(128, 32, relu), Dense(32, 9)), ADAM()))
+end
+
+
+function board2ints(board::Board)
+    state = fill(0, (3, 3))
+    state += map(x -> (x == cross) ? 1 : 0, board)
+    state += map(x -> (x == naught) ? -1 : 0, board)
+    return state
+end
+
+
+(learner::NNTTTLearner)(env::TTTEnv) = learner(state(env))
+function (learner::NNTTTLearner)(board::Board)
+
+    @assert any(empty .== board)
+    
+    state = board2ints(board)
+
+    values = learner.model(vec(state))
+    valid_actions = findall(vec(board) .== empty)
+    index = findfirst((values .== maximum(values[valid_actions])) .& (vec(board) .== empty))
+    action = findfirst(reshape(1:9, (3, 3)) .== index)
+
+    if board[action] != empty
+        println(action, values)
+    end
+    
+    @assert board[action] == empty
+
+    return action
+end
+
+function update!(learner::NNTTTLearner,
+                 trajectory::Vector{Board},
+                 actions::Vector{Action},
+                 reward::Float64)
+    Q = learner.model
+    s = map(vec, board2ints.(trajectory))
+    indices = reshape(1:9, (3, 3))
+    a = map(x -> indices[x], actions)
+    gs = gradient(params(Q)) do
+        # Zygote.ignore() do
+        #     println(a)
+        #     println(s)
+        # end
+        
+        q = [Q(s[i])[a[i]] for i in 1:length(s)]
+        q_ = vcat([maximum(Q(s[i])) for i in 1:(length(s)-1)], [reward])
+        # q_ = vcat(map(maximum, Q.(s[1:end-1])), [reward])
+        # Zygote.ignore() do
+        #     println(q)
+        #     println(q_)
+        # end
+        
+        loss = Flux.huber_loss(q, q_)
+
+        return loss
+    end
+    RLBase.update!(Q, gs)
+end
 
 
 function pp(board::Board)
